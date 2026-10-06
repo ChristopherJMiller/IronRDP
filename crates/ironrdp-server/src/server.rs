@@ -3437,8 +3437,11 @@ impl RdpServer {
                 },
                 #[cfg(feature = "egfx")]
                 ServerEvent::Egfx(msg) => match msg {
-                    EgfxServerMessage::SendMessages { messages } => {
-                        self.dispatch_egfx_messages(messages, writer, user_channel_id, udp_transport)
+                    EgfxServerMessage::SendMessages {
+                        messages,
+                        write_progress,
+                    } => {
+                        self.dispatch_egfx_messages(messages, writer, user_channel_id, udp_transport, write_progress)
                             .await?;
                     }
                 },
@@ -3510,12 +3513,14 @@ impl RdpServer {
         writer: &mut impl FramedWrite,
         user_channel_id: u16,
         udp_transport: Option<&multitransport::UdpTransportHandle>,
+        write_progress: Option<(Arc<AtomicU64>, u64)>,
     ) -> ServerResult<()> {
         let drdynvc_channel_id = self
             .get_channel_id_by_type::<dvc::DrdynvcServer>()
             .ok_or_else(|| ServerError::channel("DRDYNVC channel not found"))?;
 
         let mut route_over_udp = false;
+        let mut udp_send_failed = false;
 
         // `self.udp_migration_allowed` gates the Soft-Sync Request itself
         // (`request_reliable_udp` below): MS-RDPEDYC 3.1.5.3/3.3.5.3.1 forbid
@@ -3531,7 +3536,7 @@ impl RdpServer {
             let Some(egfx_dvc_id) = crate::gfx::egfx_channel_id(drdynvc) else {
                 trace!("EGFX channel not open yet, staying on TCP");
                 return self
-                    .write_egfx_over_tcp(messages, writer, drdynvc_channel_id, user_channel_id)
+                    .write_egfx_over_tcp(messages, writer, drdynvc_channel_id, user_channel_id, write_progress)
                     .await;
             };
 
@@ -3568,9 +3573,17 @@ impl RdpServer {
                 if !self.egfx_on_udp {
                     newly_on_udp = Some(egfx_dvc_id);
                 }
+                // Every per-message send must be accepted by the sideband
+                // transport's queue for the batch to count as written -- see
+                // `EgfxServerMessage::SendMessages`'s `write_progress` doc.
+                // Each `send` is still attempted regardless of an earlier
+                // failure: a dropped payload does not justify also dropping
+                // the rest of the batch on an otherwise-live tunnel.
                 for message in &messages {
                     let payload = message.encode_unframed_pdu().map_err(ServerError::encode)?;
-                    udp_transport.send(payload).await;
+                    if !udp_transport.send(payload).await {
+                        udp_send_failed = true;
+                    }
                 }
             }
         }
@@ -3580,9 +3593,14 @@ impl RdpServer {
         }
 
         if route_over_udp {
+            if udp_send_failed {
+                trace!("Not counting this EGFX batch as written: at least one UDP send was rejected");
+            } else {
+                note_egfx_written(write_progress);
+            }
             return Ok(());
         }
-        self.write_egfx_over_tcp(messages, writer, drdynvc_channel_id, user_channel_id)
+        self.write_egfx_over_tcp(messages, writer, drdynvc_channel_id, user_channel_id, write_progress)
             .await
     }
 
@@ -3593,13 +3611,16 @@ impl RdpServer {
         writer: &mut impl FramedWrite,
         drdynvc_channel_id: u16,
         user_channel_id: u16,
+        write_progress: Option<(Arc<AtomicU64>, u64)>,
     ) -> ServerResult<()> {
         let data =
             server_encode_svc_messages(messages, drdynvc_channel_id, user_channel_id).map_err(ServerError::encode)?;
         writer
             .write_all(&data)
             .await
-            .map_err(|e| ServerError::io("write_all", e))
+            .map_err(|e| ServerError::io("write_all", e))?;
+        note_egfx_written(write_progress);
+        Ok(())
     }
 
     /// Writes DRDYNVC output, sending the data of any channel the Soft-Sync
@@ -4806,6 +4827,19 @@ impl RdpServer {
     /// Cleared when the connection ends.
     pub fn set_connection_local_addr(&mut self, addr: Option<SocketAddr>) {
         self.connection_local_addr = addr;
+    }
+}
+
+/// Record that an EGFX event was fully written, advancing the embedder-owned
+/// counter it carried by the weight attached to it. A `None` counter (the
+/// default) is a no-op, so callers that do not opt in are unaffected. See
+/// [`crate::gfx::EgfxServerMessage::SendMessages`]'s `write_progress` field
+/// for exactly what "written" means on each transport, and for why this must
+/// only be called once the event's write has actually succeeded.
+#[cfg(feature = "egfx")]
+fn note_egfx_written(write_progress: Option<(Arc<AtomicU64>, u64)>) {
+    if let Some((counter, weight)) = write_progress {
+        counter.fetch_add(weight, Ordering::Relaxed);
     }
 }
 
