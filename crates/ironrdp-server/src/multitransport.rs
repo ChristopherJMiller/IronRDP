@@ -55,10 +55,19 @@ impl UdpTransportHandle {
     /// Sends one higher-layer (raw DVC) payload over the tunnel.
     ///
     /// A failure is logged here rather than propagated: The RDP session never
-    /// fails over an optional sideband transport.
-    pub(crate) async fn send(&self, data: Vec<u8>) {
-        if let Err(error) = self.sender.send(data).await {
-            warn!(%error, "Failed to send data over UDP transport");
+    /// fails over an optional sideband transport. Returns whether the
+    /// payload was accepted by the sideband transport's bounded send queue --
+    /// not that it reached the client, only that enqueueing it did not fail
+    /// (for example because the tunnel is already closed, or the payload is
+    /// too large for one datagram). Callers that need a write-completion
+    /// signal should treat this as that queuing guarantee, not a delivery one.
+    pub(crate) async fn send(&self, data: Vec<u8>) -> bool {
+        match self.sender.send(data).await {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(%error, "Failed to send data over UDP transport");
+                false
+            }
         }
     }
 

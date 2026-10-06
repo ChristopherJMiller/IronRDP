@@ -7,6 +7,7 @@
 //! so the display handler can call `send_avc420_frame()` proactively while the
 //! DVC infrastructure handles client messages (capability negotiation, frame acks).
 
+use core::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
 use ironrdp_core::impl_as_any;
@@ -92,15 +93,62 @@ impl DvcServerProcessor for GfxDvcBridge {}
 
 /// Message for routing EGFX PDUs to the wire via `ServerEvent`.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum EgfxServerMessage {
     /// Pre-encoded DVC messages from `GraphicsPipelineServer::drain_output()`.
-    SendMessages { messages: Vec<SvcMessage> },
+    ///
+    /// `SendMessages` is itself `#[non_exhaustive]`: build it with
+    /// [`EgfxServerMessage::send_messages`] and, if needed,
+    /// [`EgfxServerMessage::with_write_counter`], not a struct literal, so a
+    /// later field addition here does not break callers again.
+    #[non_exhaustive]
+    SendMessages {
+        messages: Vec<SvcMessage>,
+        /// Tracks how much of this event's payload has reached the
+        /// transport, as `(counter, weight)`. Once the event is fully
+        /// written, `weight` is added to `counter`:
+        /// - TCP: `FramedWrite::write_all` returned `Ok` for the encoded
+        ///   batch (the `ironrdp-tokio` framers flush as part of
+        ///   `write_all`).
+        /// - Sideband UDP (multitransport): every per-message payload in the
+        ///   batch was accepted by the sideband transport's bounded send
+        ///   queue. This is a queuing guarantee, not a delivery one -- the
+        ///   payload can still be lost on the wire after acceptance -- and a
+        ///   payload the queue rejects (closed tunnel, oversized payload) is
+        ///   never counted.
+        ///
+        /// Lets an embedder observe write progress per connection without
+        /// re-encoding. `None` (the default via
+        /// [`EgfxServerMessage::send_messages`]) keeps the prior behaviour
+        /// and is always a no-op.
+        write_progress: Option<(Arc<AtomicU64>, u64)>,
+    },
+}
+
+impl EgfxServerMessage {
+    /// Build a `SendMessages` event with no write-progress counter attached.
+    pub fn send_messages(messages: Vec<SvcMessage>) -> Self {
+        Self::SendMessages {
+            messages,
+            write_progress: None,
+        }
+    }
+
+    /// Attach a write-progress counter to this event. See the `write_progress`
+    /// field on [`Self::SendMessages`] for exactly what "written" means on
+    /// each transport.
+    #[must_use]
+    pub fn with_write_counter(mut self, counter: Arc<AtomicU64>, weight: u64) -> Self {
+        let Self::SendMessages { write_progress, .. } = &mut self;
+        *write_progress = Some((counter, weight));
+        self
+    }
 }
 
 impl core::fmt::Display for EgfxServerMessage {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::SendMessages { messages } => {
+            Self::SendMessages { messages, .. } => {
                 write!(f, "SendMessages(count={})", messages.len())
             }
         }

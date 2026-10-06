@@ -1,7 +1,7 @@
 // FIXME: tests in this module can probably be rewritten to be much shorter using the ironrdp-client crate.
 
 use core::net::SocketAddr;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use core::time::Duration;
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -1197,15 +1197,18 @@ async fn egfx_moves_onto_the_udp_tunnel_with_soft_sync() {
                     .expect("the client opened the EGFX channel");
 
                 let batch = b"first egfx batch".to_vec();
+                let written = Arc::new(AtomicU64::new(0));
+                let weight = u64::try_from(batch.len()).expect("batch length fits in u64");
                 let messages = ironrdp_dvc::encode_dvc_messages(
                     egfx_channel_id,
                     vec![Box::new(RawDvcPayload(batch.clone()))],
                     ironrdp::svc::ChannelFlags::empty(),
                 )
                 .expect("encode EGFX batch");
-                ev.send(ServerEvent::Egfx(ironrdp_server::EgfxServerMessage::SendMessages {
-                    messages,
-                }))
+                ev.send(ServerEvent::Egfx(
+                    ironrdp_server::EgfxServerMessage::send_messages(messages)
+                        .with_write_counter(Arc::clone(&written), weight),
+                ))
                 .unwrap();
 
                 // Process TCP until the Soft-Sync Request has moved the channel,
@@ -1278,6 +1281,17 @@ async fn egfx_moves_onto_the_udp_tunnel_with_soft_sync() {
                     "the batch that triggered the request goes over the tunnel"
                 );
 
+                // The server advances the counter after its own per-message
+                // UDP sends return, which races the client's view of the
+                // tunnel above -- poll instead of a bare assert.
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while written.load(Ordering::Relaxed) != weight {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("the write-progress counter advanced once the UDP batch was accepted by the send queue");
+
                 tokio::time::timeout(Duration::from_secs(10), caps_rx.recv())
                     .await
                     .expect("the server processed the early tunnel data")
@@ -1293,10 +1307,8 @@ async fn egfx_moves_onto_the_udp_tunnel_with_soft_sync() {
                     ironrdp::svc::ChannelFlags::empty(),
                 )
                 .expect("encode EGFX batch");
-                ev.send(ServerEvent::Egfx(ironrdp_server::EgfxServerMessage::SendMessages {
-                    messages,
-                }))
-                .unwrap();
+                ev.send(ServerEvent::Egfx(ironrdp_server::EgfxServerMessage::send_messages(messages)))
+                    .unwrap();
                 tokio::time::timeout(Duration::from_secs(20), async {
                     while let Ok(pdu) = framed.read_pdu().await {
                         debug!(?pdu);
@@ -1308,6 +1320,206 @@ async fn egfx_moves_onto_the_udp_tunnel_with_soft_sync() {
             });
 
             tokio::try_join!(server, client).expect("join");
+        })
+        .await;
+}
+
+/// A `write_progress` counter attached to `SendMessages` advances by exactly
+/// its weight once the batch is written over plain TCP (no multitransport),
+/// and a second batch sent with no counter leaves someone else's untouched.
+#[tokio::test]
+async fn egfx_write_counter_advances_once_the_batch_is_written_over_tcp() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    let cert_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-cert.pem");
+    let key_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-key.pem");
+    let identity = TlsIdentityCtx::init_from_paths(&cert_path, &key_path).expect("failed to init TLS identity");
+    let acceptor = identity.make_acceptor().expect("failed to build TLS acceptor");
+
+    let (caps_tx, mut caps_rx) = mpsc::unbounded_channel();
+    let (_display_tx, display_rx) = mpsc::unbounded_channel();
+    let mut server = RdpServer::builder()
+        .with_addr(([127, 0, 0, 1], 0))
+        .with_tls(acceptor)
+        .with_input_handler(TestInputHandler)
+        .with_display_handler(TestDisplay {
+            rx: Arc::new(Mutex::new(display_rx)),
+        })
+        .with_gfx_factory(Some(Box::new(TestGfxFactory { caps_tx })))
+        .build();
+    server.set_credentials(Some(server::Credentials {
+        username: USERNAME.into(),
+        password: PASSWORD.into(),
+        domain: None,
+    }));
+    let ev = server.event_sender().clone();
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                server.run().await.unwrap();
+            });
+
+            let client = tokio::task::spawn_local(async move {
+                let (tx, rx) = oneshot::channel();
+                ev.send(ServerEvent::GetLocalAddr(tx)).unwrap();
+                let server_addr = rx.await.unwrap().unwrap();
+
+                let egfx = TestEgfxClient::default();
+                let egfx_channel = Arc::clone(&egfx.channel_id);
+                let egfx_received = Arc::clone(&egfx.received);
+
+                let (mut framed, connection_result) = connect_client(server_addr, |client_addr| {
+                    let client_config = connector::Config {
+                        support_dyn_vc_gfx_protocol: true,
+                        ..default_client_config()
+                    };
+                    connector::ClientConnector::new(client_config, client_addr)
+                        .with_static_channel(DrdynvcClient::new().with_dynamic_channel(egfx))
+                })
+                .await;
+
+                let mut stage = ActiveStageBuilder {
+                    static_channels: connection_result.static_channels,
+                    user_channel_id: connection_result.user_channel_id,
+                    io_channel_id: connection_result.io_channel_id,
+                    message_channel_id: connection_result.message_channel_id,
+                    share_id: connection_result.share_id,
+                    compression_type: connection_result.compression_type,
+                    enable_server_pointer: connection_result.enable_server_pointer,
+                    pointer_software_rendering: connection_result.pointer_software_rendering,
+                }
+                .build();
+                let mut image = DecodedImage::new(PixelFormat::RgbA32, DESKTOP_WIDTH, DESKTOP_HEIGHT);
+
+                // The client advertises its capabilities when the channel opens;
+                // the server handler seeing them means the channel is open there too.
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        tokio::select! {
+                            caps = caps_rx.recv() => {
+                                caps.expect("capabilities reached the EGFX handler");
+                                break;
+                            }
+                            pdu = framed.read_pdu() => {
+                                let (action, frame) = pdu.expect("read PDU");
+                                for output in stage.process(&mut image, action, &frame).expect("stage process") {
+                                    if let ActiveStageOutput::ResponseFrame(frame) = output {
+                                        framed.write_all(&frame).await.expect("write response frame");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                })
+                .await
+                .expect("the server opened the EGFX channel");
+                let egfx_channel_id = egfx_channel
+                    .lock()
+                    .unwrap()
+                    .expect("the client opened the EGFX channel");
+
+                let counter = Arc::new(AtomicU64::new(0));
+                let batch = b"tcp write-progress batch".to_vec();
+                let weight = u64::try_from(batch.len()).expect("batch length fits in u64");
+                let messages = ironrdp_dvc::encode_dvc_messages(
+                    egfx_channel_id,
+                    vec![Box::new(RawDvcPayload(batch.clone()))],
+                    ironrdp::svc::ChannelFlags::empty(),
+                )
+                .expect("encode EGFX batch");
+                ev.send(ServerEvent::Egfx(
+                    ironrdp_server::EgfxServerMessage::send_messages(messages)
+                        .with_write_counter(Arc::clone(&counter), weight),
+                ))
+                .unwrap();
+
+                // Drive TCP until the batch itself reaches the client. The
+                // channel's own CapsConfirm (the synchronous reply to the
+                // client's initial CapsAdvertise) arrives first and is not
+                // our batch, so match on content rather than position.
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while !egfx_received.lock().unwrap().contains(&batch) {
+                        let (action, frame) = framed.read_pdu().await.expect("read PDU");
+                        for output in stage.process(&mut image, action, &frame).expect("stage process") {
+                            if let ActiveStageOutput::ResponseFrame(frame) = output {
+                                framed.write_all(&frame).await.expect("write response frame");
+                            }
+                        }
+                    }
+                })
+                .await
+                .expect("the EGFX batch arrived over TCP");
+
+                // The server advances the counter right after its own
+                // `write_all` returns, which races the client's read above --
+                // a bare assert here could sample before that increment lands.
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while counter.load(Ordering::Relaxed) != weight {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("the write-progress counter advanced by the batch's weight exactly once");
+
+                // A second batch sent with no counter attached must not touch
+                // the first one's -- proving `None` is a true no-op, not an
+                // accidental reuse of the same counter.
+                let messages = ironrdp_dvc::encode_dvc_messages(
+                    egfx_channel_id,
+                    vec![Box::new(RawDvcPayload(b"uncounted batch".to_vec()))],
+                    ironrdp::svc::ChannelFlags::empty(),
+                )
+                .expect("encode EGFX batch");
+                ev.send(ServerEvent::Egfx(ironrdp_server::EgfxServerMessage::send_messages(
+                    messages,
+                )))
+                .unwrap();
+                let second_batch = b"uncounted batch".to_vec();
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while !egfx_received.lock().unwrap().contains(&second_batch) {
+                        let (action, frame) = framed.read_pdu().await.expect("read PDU");
+                        for output in stage.process(&mut image, action, &frame).expect("stage process") {
+                            if let ActiveStageOutput::ResponseFrame(frame) = output {
+                                framed.write_all(&frame).await.expect("write response frame");
+                            }
+                        }
+                    }
+                })
+                .await
+                .expect("the second EGFX batch arrived over TCP");
+                assert_eq!(
+                    counter.load(Ordering::Relaxed),
+                    weight,
+                    "a batch sent with no write_counter must not touch someone else's"
+                );
+
+                // Client-initiated shutdown (the file's established pattern,
+                // see `client_server_with_connector`): the server ends the
+                // connection on its own once it sees this, so the single
+                // `Quit` below lands on `run()`'s now-idle accept loop
+                // instead of racing its per-connection dispatch.
+                let outputs = stage.graceful_shutdown().expect("shutdown");
+                for out in outputs {
+                    match out {
+                        ActiveStageOutput::ResponseFrame(frame) => {
+                            framed.write_all(&frame).await.expect("write frame");
+                        }
+                        _ => unimplemented!(),
+                    }
+                }
+
+                // server should probably send TLS close_notify
+                while let Ok(pdu) = framed.read_pdu().await {
+                    debug!(?pdu);
+                }
+                ev.send(ServerEvent::Quit("bye".into())).unwrap();
+            });
+
+            tokio::try_join!(server_task, client).expect("join");
         })
         .await;
 }
