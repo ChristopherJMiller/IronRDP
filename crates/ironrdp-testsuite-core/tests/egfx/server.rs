@@ -853,3 +853,97 @@ fn test_a_suspending_acknowledgement_still_acknowledges_its_frame() {
         "the suspending acknowledgement was not counted, so no round-trip sample exists"
     );
 }
+
+/// A client that suspended frame acknowledgement must stay suspended across
+/// a server-driven resize and a mid-session capability re-advertise: both run
+/// `FrameTracker::clear()`, and clearing the suspension there wedges video for
+/// good — the client sends no acknowledgement to resume, so backpressure would
+/// never lift. Keeping the flag through both is the deliberate, lower-risk
+/// choice; see `FrameTracker::clear`'s doc comment for the MS-RDPEGFX
+/// citations and the asymmetric-risk rationale, including the deviation from
+/// 3.2.5.18 on the re-advertise path. A later, ordinary acknowledgement still
+/// resumes tracking normally -- that half of the contract is the test's tail.
+#[test]
+fn ack_suspension_survives_a_resize_and_a_readvertise() {
+    let handler = Box::new(TestHandler::new());
+    let mut server = GraphicsPipelineServer::new(handler);
+    server.set_max_frames_in_flight(2);
+
+    let advertise = GfxPdu::CapabilitiesAdvertise(CapabilitiesAdvertisePdu::from_typed(&[CapabilitySet::V8_1 {
+        flags: CapabilitiesV81Flags::AVC420_ENABLED,
+    }]));
+    let _ = server.process(0, &encode_pdu(&advertise)).expect("initial advertise");
+
+    let surface_id = server.create_surface(640, 360).unwrap();
+    server.drain_output();
+
+    let idr = vec![0x00, 0x00, 0x00, 0x01, 0x65];
+    let regions = vec![Avc420Region::full_frame(640, 360, 22)];
+
+    // One frame out, then the client suspends acknowledgement for it.
+    let first = server
+        .send_avc420_frame(surface_id, &idr, &regions, 0)
+        .expect("first frame");
+    let suspend = GfxPdu::FrameAcknowledge(FrameAcknowledgePdu {
+        queue_depth: QueueDepth::Suspend,
+        frame_id: first,
+        total_frames_decoded: 1,
+    });
+    let _ = server.process(0, &encode_pdu(&suspend)).expect("suspend ack");
+    assert!(server.is_ack_suspended(), "the client just suspended acknowledgement");
+
+    // A server-initiated resize runs FrameTracker::clear().
+    server.resize(1280, 720);
+    assert!(server.is_ack_suspended(), "a resize must not resume a suspended client");
+
+    // A mid-session re-advertise (mstsc/Windows App decoder-recovery) runs it again.
+    let readvertise = GfxPdu::CapabilitiesAdvertise(CapabilitiesAdvertisePdu::from_typed(&[CapabilitySet::V8_1 {
+        flags: CapabilitiesV81Flags::AVC420_ENABLED,
+    }]));
+    let _ = server.process(0, &encode_pdu(&readvertise)).expect("re-advertise");
+    assert!(
+        server.is_ack_suspended(),
+        "a re-advertise must not resume a suspended client"
+    );
+
+    // With suspension intact the encoder is never throttled: every frame goes
+    // out though none is acknowledged. max_frames_in_flight is 2, so a tracker
+    // that forgot the suspension would return None on the third frame.
+    let surface_id = server.create_surface(1280, 720).unwrap();
+    server.drain_output();
+    let regions = vec![Avc420Region::full_frame(1280, 720, 22)];
+    let mut last_frame_id = None;
+    for i in 0..4u32 {
+        let frame_id = server.send_avc420_frame(surface_id, &idr, &regions, (i + 1) * 16);
+        assert!(
+            frame_id.is_some(),
+            "frame {i} was throttled -- the suspension was lost across clear()",
+        );
+        last_frame_id = frame_id;
+    }
+    assert!(server.is_ack_suspended(), "still suspended after sending");
+
+    // A later, non-suspend acknowledgement still resumes tracking normally:
+    // the flag clears and backpressure engages again for frames sent after it.
+    let resume = GfxPdu::FrameAcknowledge(FrameAcknowledgePdu {
+        queue_depth: QueueDepth::AvailableBytes(8),
+        frame_id: last_frame_id.expect("at least one frame was sent while suspended"),
+        total_frames_decoded: 5,
+    });
+    let _ = server.process(0, &encode_pdu(&resume)).expect("resume ack");
+    assert!(!server.is_ack_suspended(), "a non-suspend ack must resume tracking");
+
+    server.drain_output();
+    assert!(
+        server.send_avc420_frame(surface_id, &idr, &regions, 80).is_some(),
+        "the window (2) is open again right after resume"
+    );
+    assert!(
+        server.send_avc420_frame(surface_id, &idr, &regions, 96).is_some(),
+        "the window (2) is open again right after resume"
+    );
+    assert!(
+        server.send_avc420_frame(surface_id, &idr, &regions, 112).is_none(),
+        "backpressure must re-engage once the window fills -- resuming must not disable it permanently"
+    );
+}
