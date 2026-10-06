@@ -699,11 +699,38 @@ impl FrameTracker {
         self.total_acked
     }
 
-    /// Clear all tracking state
+    /// Clear per-reset tracking state.
+    ///
+    /// Deliberately keeps `ack_suspended`. This runs in two places:
+    /// - [`GraphicsPipelineServer::resize`], which sends
+    ///   RDPGFX_RESET_GRAPHICS_PDU ([3.2.5.14]). That section says nothing
+    ///   about acknowledgement state either way.
+    /// - the mid-session re-advertise branch of `handle_capabilities_advertise`
+    ///   (processing RDPGFX_CAPS_ADVERTISE_PDU, [3.2.5.18]), which requires
+    ///   the server to "reset the protocol to the initial state" but, like
+    ///   3.2.5.14, does not mention acknowledgement.
+    ///
+    /// Keeping the flag through both is a deliberate deviation from a literal
+    /// reading of [3.2.5.18]'s "initial state". A client enters suspension by
+    /// setting `queueDepth` to SUSPEND_FRAME_ACKNOWLEDGEMENT, at which point
+    /// the server MUST NOT expect any further RDPGFX_FRAME_ACKNOWLEDGE_PDU
+    /// ([3.2.5.13]); the client sends one again only if it opts back in, by
+    /// sending one with `queueDepth` in the range `0x00000000`-`0xFFFFFFFE`
+    /// in response to an RDPGFX_END_FRAME_PDU ([2.2.2.13]). So resetting the
+    /// flag here would turn backpressure back on for a client that may never
+    /// acknowledge again, wedging video for good. The risk is asymmetric:
+    /// wrongly keeping the flag costs about one RTT of untracked frames,
+    /// resolved by the client's next ordinary ack; wrongly clearing it is
+    /// unrecoverable.
+    ///
+    /// [2.2.2.13]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/0241e258-77ef-4a58-b426-5039ed6296ce
+    /// [3.2.5.13]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/d64cfae6-f30a-47e7-9655-d019d3d8fb0f
+    /// [3.2.5.14]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/1420988a-caec-4fb7-a4cd-64d1df3f681c
+    /// [3.2.5.18]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/478c0920-22a7-4817-bb25-683dc54ee570
     pub fn clear(&mut self) {
         self.unacknowledged.clear();
         self.client_queue_depth = 0;
-        self.ack_suspended = false;
+        // `ack_suspended` intentionally preserved — see the doc comment.
     }
 }
 
@@ -1344,6 +1371,19 @@ impl GraphicsPipelineServer {
     #[must_use]
     pub fn client_queue_depth(&self) -> u32 {
         self.frames.client_queue_depth()
+    }
+
+    /// Whether the client has suspended frame acknowledgement by setting
+    /// `queueDepth` to SUSPEND_FRAME_ACKNOWLEDGEMENT ([3.2.5.13]). While
+    /// suspended the server tracks no frames and [`Self::should_backpressure`]
+    /// is always `false`; an embedder running its own flow control on top of
+    /// this server should not expect further acknowledgements until the
+    /// client sends one on its own.
+    ///
+    /// [3.2.5.13]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/d64cfae6-f30a-47e7-9655-d019d3d8fb0f
+    #[must_use]
+    pub fn is_ack_suspended(&self) -> bool {
+        self.frames.is_ack_suspended()
     }
 
     /// Set the maximum frames in flight before backpressure
@@ -2058,6 +2098,9 @@ impl GraphicsPipelineServer {
                  state for re-initialization (no DeleteSurface PDU emitted, surface ID counter reset)"
             );
             self.surfaces.reset_for_reinit();
+            // Deviation from [3.2.5.18] (which requires resetting "the
+            // protocol to the initial state" here): `clear()` deliberately
+            // keeps `ack_suspended` -- see its doc comment.
             self.frames.clear();
             self.reset_graphics_sent = false;
         }
