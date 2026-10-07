@@ -20,8 +20,9 @@ use ironrdp::pdu::rdp::headers::CompressionFlags;
 use ironrdp::pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode};
 use ironrdp::pdu::{self, gcc};
 use ironrdp::server::{
-    self, Acceptor, DesktopSize, DisplayUpdate, KeyboardEvent, MouseEvent, PixelFormat, RdpServer, RdpServerDisplay,
-    RdpServerDisplayUpdates, RdpServerInputHandler, ServerEvent, ServerResult, StaticChannelFactory, TlsIdentityCtx,
+    self, Acceptor, BitmapUpdate, DesktopSize, DisplayUpdate, KeyboardEvent, MouseEvent, PixelFormat, RdpServer,
+    RdpServerDisplay, RdpServerDisplayUpdates, RdpServerInputHandler, ServerEvent, ServerResult, StaticChannelFactory,
+    TlsIdentityCtx,
 };
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{self, ActiveStage, ActiveStageBuilder, ActiveStageOutput};
@@ -1800,6 +1801,52 @@ fn hook_recording_server(
     (server, counts, display_tx)
 }
 
+/// Each connection's own [`server::ConnectionAbortHandle`], in arrival
+/// order, as recorded by [`AbortHandleRecorder`].
+type RecordedAbortHandles = Arc<StdMutex<Vec<server::ConnectionAbortHandle>>>;
+
+/// A TLS server under `policy`, wired to an [`AbortHandleRecorder`] instead
+/// of a plain [`HookRecorder`]: the same accept/info/disconnect counts, plus
+/// each connection's own [`server::ConnectionAbortHandle`] (via
+/// [`server::ConnectionInfo::abort_handle`]) captured in arrival order. Keep
+/// the returned display sender alive, same reason as [`hook_recording_server`].
+fn abort_handle_recording_server(
+    policy: server::ConnectionPolicy,
+) -> (
+    RdpServer,
+    Arc<HookCounts>,
+    RecordedAbortHandles,
+    UnboundedSender<DisplayUpdate>,
+) {
+    let cert_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-cert.pem");
+    let key_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-key.pem");
+    let identity = TlsIdentityCtx::init_from_paths(&cert_path, &key_path).expect("failed to init TLS identity");
+    let acceptor = identity.make_acceptor().expect("failed to build TLS acceptor");
+
+    let counts = Arc::new(HookCounts::default());
+    let handles: RecordedAbortHandles = Arc::new(StdMutex::new(Vec::new()));
+    let (display_tx, display_rx) = mpsc::unbounded_channel();
+    let mut server = RdpServer::builder()
+        .with_addr(([127, 0, 0, 1], 0))
+        .with_tls(acceptor)
+        .with_input_handler(TestInputHandler)
+        .with_display_handler(TestDisplay {
+            rx: Arc::new(Mutex::new(display_rx)),
+        })
+        .with_connection_handler(Some(Box::new(AbortHandleRecorder {
+            counts: Arc::clone(&counts),
+            handles: Arc::clone(&handles),
+        })))
+        .with_connection_policy(policy)
+        .build();
+    server.set_credentials(Some(server::Credentials {
+        username: USERNAME.into(),
+        password: PASSWORD.into(),
+        domain: None,
+    }));
+    (server, counts, handles, display_tx)
+}
+
 async fn local_addr_of(ev: &UnboundedSender<ServerEvent>) -> SocketAddr {
     let (tx, rx) = oneshot::channel();
     ev.send(ServerEvent::GetLocalAddr(tx)).unwrap();
@@ -2126,6 +2173,485 @@ async fn a_fresh_entry_does_not_inherit_the_previous_sessions_stale_events() {
         assert_eq!(disconnected_after_fresh_event, 2);
 
         drop(b);
+        server_task.abort();
+    }))
+    .await;
+}
+
+/// A connection that never ends on its own -- no more PDUs, no display
+/// updates, no server events -- must still be droppable: the embedder's
+/// watchdog calls `ConnectionAbortHandle::abort()` (obtained from
+/// `ConnectionInfo::abort_handle()`, the only route -- there is no
+/// server-scoped convenience) when `on_disconnected` is overdue, and that
+/// must make the connection future resolve so `on_disconnected` teardown
+/// actually runs, rather than hang forever waiting for a peer or an event
+/// that will never come.
+///
+/// Drives one wedged connection under `policy` and returns the final
+/// `(accept, info, disconnected)` counts, same shape as
+/// [`hooks_reaching_handler_under`]: a single connection is served
+/// regardless of policy, so this exercises exactly one of the six
+/// `serve_with_abort`-wrapped call sites per policy (each policy's own
+/// `Fresh` arm -- `Negotiated` is unreachable without a second, preempting
+/// connection, which this test does not drive).
+async fn connection_abort_handle_drops_a_wedged_connection_under(
+    policy: server::ConnectionPolicy,
+) -> (usize, usize, usize) {
+    let (mut server, counts, handles, _display_tx) = abort_handle_recording_server(policy);
+    let ev = server.event_sender().clone();
+
+    let local = tokio::task::LocalSet::new();
+    Box::pin(local.run_until(async move {
+        let server_task = tokio::task::spawn_local(async move {
+            let _ = server.run().await;
+        });
+        let server_addr = local_addr_of(&ev).await;
+        let (client, _) = connect_client(server_addr, |client_addr| {
+            connector::ClientConnector::new(default_client_config(), client_addr)
+        })
+        .await;
+
+        assert_eq!(
+            counts.wait_until(|(_, info, _)| info >= 1).await,
+            (1, 1, 0),
+            "the connection must be live before we try to abort it"
+        );
+        let abort = handles.lock().expect("lock")[0].clone();
+
+        // Confirm it is genuinely wedged: idle, nobody reads or writes
+        // anything further, so without an abort it would just sit here.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            counts.get().2,
+            0,
+            "the connection must not end on its own while idle -- otherwise this test would not be exercising the abort at all"
+        );
+
+        abort.abort();
+
+        let counts = tokio::time::timeout(Duration::from_secs(5), counts.wait_until(|(_, _, disc)| disc >= 1))
+            .await
+            .expect("the abort must make the wedged connection's teardown run");
+
+        drop(client);
+        server_task.abort();
+        counts
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn connection_abort_handle_drops_a_wedged_connection_under_queue() {
+    let (_, _, disconnected) =
+        connection_abort_handle_drops_a_wedged_connection_under(server::ConnectionPolicy::Queue).await;
+    assert_eq!(
+        disconnected, 1,
+        "on_disconnected must fire exactly once for the aborted connection"
+    );
+}
+
+#[tokio::test]
+async fn connection_abort_handle_drops_a_wedged_connection_under_preempt() {
+    // A session-takeover embedder runs under this policy: a regression here
+    // would silently remove the hard-close path without affecting `Queue`.
+    let (_, _, disconnected) =
+        connection_abort_handle_drops_a_wedged_connection_under(server::ConnectionPolicy::Preempt).await;
+    assert_eq!(
+        disconnected, 1,
+        "on_disconnected must fire exactly once for the aborted connection"
+    );
+}
+
+#[tokio::test]
+async fn connection_abort_handle_drops_a_wedged_connection_under_reject() {
+    let (_, _, disconnected) =
+        connection_abort_handle_drops_a_wedged_connection_under(server::ConnectionPolicy::Reject).await;
+    assert_eq!(
+        disconnected, 1,
+        "on_disconnected must fire exactly once for the aborted connection"
+    );
+}
+
+/// A `ConnectionHandler` that records each connection's
+/// `ConnectionInfo::abort_handle()` in order, so a test can retrieve A's and
+/// B's handles separately after the fact.
+struct AbortHandleRecorder {
+    counts: Arc<HookCounts>,
+    handles: RecordedAbortHandles,
+}
+
+impl server::ConnectionHandler for AbortHandleRecorder {
+    fn on_accept(&mut self, _peer: SocketAddr) -> bool {
+        self.counts.accept.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
+    fn on_connection_info(&mut self, info: &server::ConnectionInfo) {
+        self.counts.info.fetch_add(1, Ordering::SeqCst);
+        self.handles.lock().expect("lock").push(info.abort_handle());
+    }
+
+    fn on_disconnected(
+        &mut self,
+        _peer: SocketAddr,
+        _duration: Duration,
+        _error: Option<&server::ServerError>,
+    ) -> server::PostConnectionAction {
+        self.counts.disconnected.fetch_add(1, Ordering::SeqCst);
+        server::PostConnectionAction::Continue
+    }
+}
+
+/// `ConnectionInfo::abort_handle()` is scoped to the one connection it was
+/// issued for, by construction, unlike `RdpServer::connection_abort_handle()`'s
+/// server-scoped convenience (covered above, used immediately in every
+/// case): a handle retained past the connection it was built for must be
+/// permanently inert, even though another connection is later served through
+/// the very same `RdpServer`. `ConnectionPolicy::Queue`, so B is only
+/// accepted once A has fully ended -- the exact "late abort meant for A
+/// arrives after B started" shape this guards against.
+#[tokio::test]
+async fn connection_info_abort_handle_cannot_reach_a_later_connection() {
+    let cert_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-cert.pem");
+    let key_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-key.pem");
+    let identity = TlsIdentityCtx::init_from_paths(&cert_path, &key_path).expect("failed to init TLS identity");
+    let acceptor = identity.make_acceptor().expect("failed to build TLS acceptor");
+
+    let counts = Arc::new(HookCounts::default());
+    let handles: RecordedAbortHandles = Arc::new(StdMutex::new(Vec::new()));
+    // Kept alive (bound, never dropped) for the whole test: dropping it ends
+    // the display stream and closes the session, same reason as
+    // `hook_recording_server`.
+    let (_display_tx, display_rx) = mpsc::unbounded_channel();
+    let mut server = RdpServer::builder()
+        .with_addr(([127, 0, 0, 1], 0))
+        .with_tls(acceptor)
+        .with_input_handler(TestInputHandler)
+        .with_display_handler(TestDisplay {
+            rx: Arc::new(Mutex::new(display_rx)),
+        })
+        .with_connection_handler(Some(Box::new(AbortHandleRecorder {
+            counts: Arc::clone(&counts),
+            handles: Arc::clone(&handles),
+        })))
+        .with_connection_policy(server::ConnectionPolicy::Queue)
+        .build();
+    server.set_credentials(Some(server::Credentials {
+        username: USERNAME.into(),
+        password: PASSWORD.into(),
+        domain: None,
+    }));
+    let ev = server.event_sender().clone();
+
+    let local = tokio::task::LocalSet::new();
+    Box::pin(local.run_until(async move {
+        let server_task = tokio::task::spawn_local(async move {
+            let _ = server.run().await;
+        });
+        let server_addr = local_addr_of(&ev).await;
+        let connect = || {
+            connect_client(server_addr, |client_addr| {
+                connector::ClientConnector::new(default_client_config(), client_addr)
+            })
+        };
+
+        let (a, _) = connect().await;
+        assert_eq!(counts.wait_until(|(_, info, _)| info >= 1).await, (1, 1, 0));
+        let a_handle = handles.lock().expect("lock")[0].clone();
+
+        // End A on its own terms (not via its handle), so its own
+        // `on_disconnected` is the only thing that bumps the count to 1
+        // before B exists at all.
+        drop(a);
+        counts.wait_until(|(_, _, disc)| disc >= 1).await;
+
+        let (_b, _) = connect().await;
+        assert_eq!(
+            counts.wait_until(|(accept, info, _)| accept >= 2 && info >= 2).await,
+            (2, 2, 1),
+            "B must be live before we try A's stale handle against it"
+        );
+
+        // The late abort: A's handle, retained past A's own lifetime, must
+        // not touch B.
+        a_handle.abort();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            counts.get(),
+            (2, 2, 1),
+            "A's stale handle must be a permanent no-op, even with B now live"
+        );
+
+        // Prove the mechanism is not simply inert outright: B's OWN handle
+        // must still work.
+        let b_handle = handles.lock().expect("lock")[1].clone();
+        b_handle.abort();
+        let final_counts = tokio::time::timeout(Duration::from_secs(5), counts.wait_until(|(_, _, disc)| disc >= 2))
+            .await
+            .expect("B's own handle must still abort B");
+        assert_eq!(final_counts, (2, 2, 2));
+
+        server_task.abort();
+    }))
+    .await;
+}
+
+/// N1: the per-connection guarantee depends on `connection_abort` being
+/// reminted BEFORE a connection's future is built, not after it completes --
+/// otherwise a serve that is CANCELLED (its future dropped without
+/// completing) never reaches the remint at all, and the next call shares
+/// the SAME `Notify` with the one that got cancelled. Drive exactly that
+/// through `run_connection_with`, the embedder-driven path (not `run()`):
+/// an embedder with its own accept loop cancels its call for A mid-session,
+/// then serves B through the same `RdpServer` with another call. A's stale
+/// handle must not reach B.
+#[tokio::test]
+async fn a_cancelled_run_connection_with_does_not_let_a_stale_handle_reach_the_next_connection() {
+    let cert_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-cert.pem");
+    let key_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-key.pem");
+    let identity = TlsIdentityCtx::init_from_paths(&cert_path, &key_path).expect("failed to init TLS identity");
+    let acceptor = identity.make_acceptor().expect("failed to build TLS acceptor");
+
+    let counts = Arc::new(HookCounts::default());
+    let handles: RecordedAbortHandles = Arc::new(StdMutex::new(Vec::new()));
+    let (_display_tx, display_rx) = mpsc::unbounded_channel();
+    let mut server = RdpServer::builder()
+        .with_addr(([127, 0, 0, 1], 0))
+        .with_tls(acceptor)
+        .with_input_handler(TestInputHandler)
+        .with_display_handler(TestDisplay {
+            rx: Arc::new(Mutex::new(display_rx)),
+        })
+        .with_connection_handler(Some(Box::new(AbortHandleRecorder {
+            counts: Arc::clone(&counts),
+            handles: Arc::clone(&handles),
+        })))
+        .build();
+    server.set_credentials(Some(server::Credentials {
+        username: USERNAME.into(),
+        password: PASSWORD.into(),
+        domain: None,
+    }));
+
+    let local = tokio::task::LocalSet::new();
+    Box::pin(local.run_until(async move {
+        // `RdpServer::run()` is not used at all here: this models an
+        // embedder with its own accept loop, calling `run_connection_with`
+        // directly, which is the exact shape N1 was reproduced through.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let server_addr = listener.local_addr().expect("local_addr");
+
+        let server_task = tokio::task::spawn_local(async move {
+            let (stream_a, _) = listener.accept().await.expect("accept A");
+            let _ = stream_a.set_nodelay(true);
+            // Cancel A's serve mid-session: an idle connection (no PDUs, no
+            // display updates, no server events) never finishes on its own,
+            // so this timeout always fires and drops `run_connection_with`'s
+            // future before it completes -- the exact shape that skipped
+            // the old end-of-serve remint.
+            let _ = tokio::time::timeout(
+                Duration::from_millis(300),
+                server.run_connection_with(stream_a, server::TransportTls::Managed),
+            )
+            .await;
+
+            let (stream_b, _) = listener.accept().await.expect("accept B");
+            let _ = stream_b.set_nodelay(true);
+            // No outer timeout on B: idle like A, it must hang here until
+            // something ends it. If A's stale handle reaches it, this
+            // returns early; if not, it only returns once B's OWN handle
+            // (below) aborts it.
+            let _ = server
+                .run_connection_with(stream_b, server::TransportTls::Managed)
+                .await;
+        });
+
+        let connect = || {
+            connect_client(server_addr, |client_addr| {
+                connector::ClientConnector::new(default_client_config(), client_addr)
+            })
+        };
+
+        // Held until the very end, deliberately: dropping it early would
+        // close A's socket from the client side, which ends A's serve
+        // through a normal read error instead of the cancellation this test
+        // means to exercise -- a normal end reminted the `Notify` in BOTH
+        // the buggy and fixed designs, which would make this test pass
+        // either way.
+        let (a, _) = connect().await;
+        assert_eq!(
+            counts.wait_until(|(_, info, _)| info >= 1).await.1,
+            1,
+            "A must complete its handshake before its serve is cancelled"
+        );
+        let a_handle = handles.lock().expect("lock")[0].clone();
+
+        let (b, _) = tokio::time::timeout(Duration::from_secs(5), connect())
+            .await
+            .expect("B must be accepted and complete its handshake after A's serve is cancelled");
+        assert_eq!(
+            counts.wait_until(|(_, info, _)| info >= 2).await.1,
+            2,
+            "B's own on_connection_info must have fired"
+        );
+        let b_handle = handles.lock().expect("lock")[1].clone();
+
+        // The late abort: A's handle, from a CANCELLED serve, must not touch B.
+        a_handle.abort();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !server_task.is_finished(),
+            "A's stale handle must not end B's still-running run_connection_with call"
+        );
+
+        // Prove the mechanism still works: B's own handle must end it.
+        b_handle.abort();
+        tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("B's own handle must make its run_connection_with call return")
+            .expect("join");
+
+        drop(a);
+        drop(b);
+    }))
+    .await;
+}
+
+/// A test double whose writes never complete, standing in for a peer that
+/// stopped reading: the kernel send buffer eventually fills and `write_all`
+/// blocks, which here is modeled directly rather than via real TCP
+/// backpressure (a single `ServerSetErrorInfoPdu` is far too small to fill a
+/// loopback socket's buffer in a fast, deterministic test).
+struct WedgedWriter;
+
+impl ironrdp_async::FramedWrite for WedgedWriter {
+    type WriteAllFut<'write> = core::future::Pending<std::io::Result<()>>;
+
+    fn write_all<'a>(&'a mut self, _buf: &'a [u8]) -> Self::WriteAllFut<'a> {
+        core::future::pending()
+    }
+}
+
+/// A server-initiated disconnect ([`ServerEvent::Disconnect`]) must put the
+/// reason on the wire on a bounded write and then disconnect even if the
+/// peer never reads, so a stalled client cannot wedge the dispatch loop just
+/// because it has not acknowledged why it is being disconnected.
+#[tokio::test]
+async fn a_server_initiated_disconnect_is_bounded_when_the_peer_stops_reading() {
+    let mut server = RdpServer::builder()
+        .with_addr((core::net::Ipv4Addr::LOCALHOST, 0))
+        .with_no_security()
+        .with_no_input()
+        .with_no_display()
+        .build();
+
+    let mut events = vec![ServerEvent::Disconnect(ErrorInfo::ProtocolIndependentCode(
+        ProtocolIndependentCode::ServerDeniedConnection,
+    ))];
+    let mut writer = WedgedWriter;
+
+    let is_disconnect = tokio::time::timeout(
+        Duration::from_secs(2),
+        server.__test_dispatch_server_events(&mut events, &mut writer, 1003, 1002, None),
+    )
+    .await
+    .expect("the bounded SetErrorInfo write must return even when the peer never reads")
+    .expect("a bounded disconnect write must not surface as a session error");
+
+    assert!(is_disconnect);
+}
+
+/// Bounding the `Disconnect` write alone is not enough: the TLS `shutdown()`
+/// that runs immediately afterward (`finalize_and_shutdown`, once the
+/// dispatch loop has actually exited) queues `close_notify` and then loops
+/// writing until rustls's internal buffer drains, which blocks on a peer
+/// that stopped reading exactly like any other write -- just one step later
+/// than the one that is already bounded. Drive this over a REAL TLS
+/// connection (not `__test_dispatch_server_events`, which stops at the
+/// dispatch loop's own return and never reaches `finalize_and_shutdown` at
+/// all): flood the display path with enough distinct, incompressible frames
+/// to fill the actual TCP+TLS pipe, stop the peer from reading anything,
+/// then disconnect. `on_disconnected` must land within a couple of bounded
+/// grace windows, not hang on a peer that may never read again.
+#[tokio::test]
+async fn a_server_initiated_disconnect_tears_down_promptly_over_tls_when_the_peer_stops_reading() {
+    let (mut server, counts, display_tx) = hook_recording_server(server::ConnectionPolicy::Queue);
+    let ev = server.event_sender().clone();
+
+    let local = tokio::task::LocalSet::new();
+    Box::pin(local.run_until(async move {
+        let server_task = tokio::task::spawn_local(async move {
+            let _ = server.run().await;
+        });
+        let server_addr = local_addr_of(&ev).await;
+        let (client, _) = connect_client(server_addr, |client_addr| {
+            connector::ClientConnector::new(default_client_config(), client_addr)
+        })
+        .await;
+        // Held for the rest of the test, but never read again: models a peer
+        // that stopped consuming entirely.
+        let _client = client;
+
+        assert_eq!(
+            counts.wait_until(|(_, info, _)| info >= 1).await,
+            (1, 1, 0),
+            "the connection must be live before we flood and disconnect it"
+        );
+
+        // Each frame distinct (a per-frame nonce mixed into a cheap
+        // multiplicative hash -- no `rand` dependency here, and genuine
+        // randomness is not the point): identical consecutive frames would
+        // let a diff/compression step collapse them to almost nothing,
+        // defeating the flood. 96 full-desktop frames is far more than
+        // enough to exceed any realistic loopback socket buffer even after
+        // compression. The HIGH byte of the multiply (`to_le_bytes()[3]`),
+        // not the low one: in `i.wrapping_mul(CONST)`, the low byte depends
+        // only on `i mod 256` (multiplication mod 2^8 only sees the low 8
+        // bits of each operand), so it repeats every 256 bytes -- a classic
+        // LCG weakness. The high byte depends on nearly all of `i`'s bits
+        // (via carry propagation through the multiplication) and does not
+        // repeat at any practical period, which is what "incompressible"
+        // actually requires here.
+        let frame_len = usize::from(DESKTOP_WIDTH) * usize::from(DESKTOP_HEIGHT) * 4;
+        for frame_idx in 0..96u32 {
+            let nonce = frame_idx.wrapping_mul(0x9E37_79B9);
+            let data: Vec<u8> = (0..frame_len)
+                .map(|i| {
+                    let i = u32::try_from(i).unwrap_or(u32::MAX);
+                    (i.wrapping_mul(2_654_435_761) ^ nonce).to_le_bytes()[3]
+                })
+                .collect();
+            let _ = display_tx.send(DisplayUpdate::Bitmap(BitmapUpdate {
+                x: 0,
+                y: 0,
+                width: core::num::NonZeroU16::new(DESKTOP_WIDTH).expect("nonzero"),
+                height: core::num::NonZeroU16::new(DESKTOP_HEIGHT).expect("nonzero"),
+                format: PixelFormat::BgrX32,
+                data: data.into(),
+                stride: core::num::NonZeroUsize::new(usize::from(DESKTOP_WIDTH) * 4).expect("nonzero"),
+            }));
+        }
+
+        // Give the dispatch loop a moment to start pushing frames onto a
+        // socket nobody is draining, so the write that `Disconnect` lands
+        // behind is actually blocked, not merely queued.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        ev.send(ServerEvent::Disconnect(ErrorInfo::ProtocolIndependentCode(
+            ProtocolIndependentCode::ServerDeniedConnection,
+        )))
+        .unwrap();
+
+        let (_, _, disconnected) = tokio::time::timeout(
+            Duration::from_secs(3),
+            counts.wait_until(|(_, _, disc)| disc >= 1),
+        )
+        .await
+        .expect(
+            "teardown over TLS must complete within a couple of bounded-grace windows, not hang on the stalled peer",
+        );
+        assert_eq!(disconnected, 1);
+
         server_task.abort();
     }))
     .await;

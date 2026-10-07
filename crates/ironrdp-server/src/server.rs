@@ -121,12 +121,20 @@ pub enum PostConnectionAction {
 /// Per-connection metadata captured during connection setup, made available to
 /// [`ConnectionHandler::on_connection_info`] once the connection is established.
 ///
-/// These are GCC Client Core Data fields (MS-RDPBCGR 2.2.1.3.2) that the acceptor
-/// captures but has no use for itself; embedders that want to act on them (for
-/// example, selecting a server-side keyboard layout matching the client) can do
-/// so here without reaching into the acceptor's internals.
+/// The three `pub` fields are GCC Client Core Data fields (MS-RDPBCGR
+/// 2.2.1.3.2) that the acceptor captures but has no use for itself;
+/// embedders that want to act on them (for example, selecting a server-side
+/// keyboard layout matching the client) can do so here without reaching into
+/// the acceptor's internals. [`Self::abort_handle`] is unrelated to GCC data;
+/// see its own doc.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
+#[expect(
+    clippy::partial_pub_fields,
+    reason = "abort_handle is deliberately NOT pub -- see its own doc comment: construction must stay funneled \
+              through code that can guarantee it is either a real, connection-specific handle or the inert \
+              placeholder Self::new uses"
+)]
 pub struct ConnectionInfo {
     /// See [`ironrdp_acceptor::AcceptorResult::keyboard_layout`].
     pub keyboard_layout: u32,
@@ -134,6 +142,13 @@ pub struct ConnectionInfo {
     pub keyboard_type: ironrdp_pdu::gcc::KeyboardType,
     /// See [`ironrdp_acceptor::AcceptorResult::ime_file_name`].
     pub ime_file_name: String,
+    /// Backing storage for [`Self::abort_handle`]. Private (unlike the three
+    /// fields above) so construction stays funneled through code that can
+    /// guarantee it is either a real, connection-specific handle or the inert
+    /// placeholder [`Self::new`] uses -- a `pub` field would let a caller
+    /// substitute an unrelated `ConnectionAbortHandle` and defeat that
+    /// guarantee.
+    abort_handle: ConnectionAbortHandle,
 }
 
 impl ConnectionInfo {
@@ -141,12 +156,28 @@ impl ConnectionInfo {
     /// that want to exercise [`ConnectionHandler::on_connection_info`] in their own unit tests
     /// without going through a live connection. `#[non_exhaustive]` blocks struct-literal
     /// construction outside this crate, so a constructor is the only way to do that.
+    ///
+    /// [`Self::abort_handle`] on a `ConnectionInfo` built this way is always
+    /// inert: it owns a `Notify` nothing ever serves, so `abort()` on it is a
+    /// permanent no-op. There is no real connection here to abort.
     pub fn new(keyboard_layout: u32, keyboard_type: ironrdp_pdu::gcc::KeyboardType, ime_file_name: String) -> Self {
         Self {
             keyboard_layout,
             keyboard_type,
             ime_file_name,
+            abort_handle: ConnectionAbortHandle {
+                notify: Arc::new(tokio::sync::Notify::new()),
+            },
         }
+    }
+
+    /// A handle that aborts THIS connection specifically -- see
+    /// [`ConnectionAbortHandle`]'s own doc. It owns the one `Notify` minted
+    /// for this connection, so it is safe to hold onto for as long as the
+    /// embedder likes: it cannot reach any other connection, including one
+    /// served later through the same [`RdpServer`] after this one ends.
+    pub fn abort_handle(&self) -> ConnectionAbortHandle {
+        self.abort_handle.clone()
     }
 }
 
@@ -853,6 +884,35 @@ pub struct RdpServer {
     /// response over TCP, so its first tunnel data can overtake it; this holds
     /// that data until the response is in instead of dropping it.
     early_tunnel_payloads: VecDeque<Vec<u8>>,
+    /// Fires to drop the connection currently being served regardless of what
+    /// it is doing, so `on_disconnected` teardown runs even if its writer is
+    /// blocked on a peer that stopped reading. See [`ConnectionAbortHandle`].
+    ///
+    /// A fresh [`tokio::sync::Notify`] is minted for every connection this
+    /// struct serves -- in `run()`'s accept loop, and in
+    /// [`Self::run_connection_with`] for an embedder driving its own accept
+    /// loop -- at the START of serving it, before that connection's future is
+    /// even built. Each connection's own [`ConnectionInfo`] carries a
+    /// [`ConnectionAbortHandle`] (via [`ConnectionInfo::abort_handle`]) built
+    /// from whatever this field holds at that point, which is then that
+    /// connection's OWN `Notify` for its entire lifetime, no matter how this
+    /// field is reminted afterward. That is what makes a handle obtained from
+    /// `ConnectionInfo` safe to hold onto: it owns a specific `Notify`, not a
+    /// slot that gets overwritten from under it, so it is physically
+    /// incapable of reaching any connection other than the one it was issued
+    /// for, including a later one served through this same field.
+    ///
+    /// Minted at the START, not the end: reminting only after a serve
+    /// completes sounds equivalent, but it is not when that serve's future is
+    /// instead DROPPED without completing (an embedder cancelling its own
+    /// `run_connection_with` call, or `run()` itself being dropped and called
+    /// again) -- the end-of-serve remint would then simply never run, and the
+    /// next connection would share the SAME `Notify` with the one that got
+    /// cancelled, so a stale handle from it could abort the next connection.
+    /// Minting up front has no such gap: by the time any connection's future
+    /// starts running at all, this field already holds a `Notify` nothing
+    /// else will ever reuse.
+    connection_abort: Arc<tokio::sync::Notify>,
 }
 
 /// Cloneable handle for updating the Server Auto-Reconnect Cookie while
@@ -903,6 +963,71 @@ impl ErrorInfoDisconnectHandle {
     )]
     pub fn disconnect(&self, error: ErrorInfo) -> Result<(), mpsc::error::SendError<ServerEvent>> {
         self.sender.send(ServerEvent::Disconnect(error))
+    }
+}
+
+/// Drops one specific connection's future even while its writer is blocked
+/// on a peer that stopped reading, so `on_disconnected` runs and the session
+/// is released. Triggered from a watchdog when a graceful
+/// [`ErrorInfoDisconnectHandle::disconnect`] has not landed in time.
+///
+/// Get one from [`ConnectionInfo::abort_handle`] inside
+/// [`ConnectionHandler::on_connection_info`] -- the only way to obtain one. A
+/// fresh [`tokio::sync::Notify`] is minted for every connection before that
+/// connection's future is even built, so this handle owns one specific
+/// instance and cannot reach any other connection, past or future, even one
+/// served later through the same [`RdpServer`]. Calling [`Self::abort`]
+/// after the connection it targets has already ended is a permanent no-op,
+/// by construction: nothing is ever waiting on that instance's `Notify`
+/// again. It is therefore safe to hold onto for as long as the embedder
+/// likes, including well past the connection ending.
+///
+/// Unlike [`ErrorInfoDisconnectHandle`], which asks the client to disconnect
+/// and depends on it reading the request, this one does not negotiate: the
+/// connection future is dropped outright, exactly as
+/// [`RdpServerOptions::preempt_existing_session`]'s eviction race already
+/// drops an incumbent that does not wind down within `EVICTION_GRACE`.
+#[derive(Clone, Debug)]
+pub struct ConnectionAbortHandle {
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl ConnectionAbortHandle {
+    /// Abort the connection this handle was issued for; a no-op if it has
+    /// already ended (by construction, not by luck -- see the struct doc).
+    pub fn abort(&self) {
+        self.notify.notify_waiters();
+    }
+}
+
+/// Serve `conn`, but drop it if `abort` fires first. Dropping the future
+/// runs the same per-connection teardown a client-side disconnect does
+/// (identical in kind to the `EVICTION_GRACE` cancellation of the preemption
+/// race, just triggered by the embedder instead of a timeout).
+///
+/// `biased`, with `conn` listed first: without it, an abort that happens to
+/// land in the same poll as `conn`'s own completion could win the random
+/// pick and replace a real `Err` with `Ok(())`, hiding the actual outcome
+/// from `on_disconnected` and from the "Connection error" log. Preferring
+/// `conn` costs nothing -- if `conn` is also ready, the abort was redundant
+/// anyway.
+async fn serve_with_abort<F>(conn: F, abort: Arc<tokio::sync::Notify>) -> ServerResult<()>
+where
+    F: Future<Output = ServerResult<()>>,
+{
+    tokio::pin!(conn);
+    tokio::select! {
+        biased;
+        res = &mut conn => res,
+        () = abort.notified() => {
+            // `info!`, not `debug!`: an embedder-forced drop is a deliberate
+            // administrative action, not routine traffic, and `on_disconnected`
+            // will report it as a clean end (`error: None`) since dropping the
+            // future does not produce a `ServerError` -- this log is the only
+            // record that it was actually an abort.
+            info!("connection aborted by handle; dropping the connection future so teardown runs");
+            Ok(())
+        }
     }
 }
 
@@ -1236,6 +1361,32 @@ where
 /// exceeding it is not an error, it just degrades to an abrupt drop.
 const EVICTION_GRACE: Duration = Duration::from_millis(750);
 
+/// How long each of the two steps of a server-initiated disconnect -- the
+/// `ServerSetErrorInfo` write on [`ServerEvent::Disconnect`], and the TLS
+/// `shutdown()` ([`Self::finalize_and_shutdown`]) that follows once the
+/// dispatch loop has actually exited -- may take before giving up and moving
+/// on anyway. A peer that has stopped reading must not hold either step open
+/// just because it has not acknowledged why it is being disconnected: a
+/// `close_notify` write can block exactly like any other write on a peer
+/// advertising a zero TCP receive window, which (without `TCP_USER_TIMEOUT`)
+/// never times out on its own.
+///
+/// Applied independently to each step (so a worst case is bounded by roughly
+/// twice this value, not once), rather than introducing a second constant:
+/// both steps are "deliver something best-effort, then leave regardless",
+/// and splitting the budget unevenly between them would need its own
+/// justification this doesn't have evidence for.
+///
+/// 500ms, not [`EVICTION_GRACE`]'s 750ms: the two bound different things.
+/// `EVICTION_GRACE` waits for an INCUMBENT connection to notice an eviction
+/// and wind itself down through its own normal dispatch loop -- a healthy
+/// peer doing real protocol work, where a little slack is cheap and
+/// preserves a clean handoff. This bounds a single best-effort write (or
+/// shutdown) to a peer the server has already decided to disconnect; nothing
+/// downstream depends on it taking longer, and an embedder watching for the
+/// disconnect on its own multi-second budget treats either grace as noise.
+const DISCONNECT_STEP_GRACE: Duration = Duration::from_millis(500);
+
 /// How long a candidate gets to complete negotiation and authentication before
 /// it is abandoned.
 ///
@@ -1568,6 +1719,7 @@ impl RdpServer {
             udp_migration_allowed: false,
             egfx_on_udp: false,
             early_tunnel_payloads: VecDeque::new(),
+            connection_abort: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -2230,7 +2382,19 @@ impl RdpServer {
     where
         S: AsyncRead + AsyncWrite + Send + Sync + Unpin,
     {
-        let result = self.run_connection_inner(stream, tls).await;
+        // Mint THIS call's `Notify` before building its connection future at
+        // all -- see `connection_abort`'s own doc for why at the START, not
+        // the end: reminting only after a serve completes leaves the
+        // previous `Notify` shared with the next call if THIS one's future
+        // is instead dropped without completing (the caller cancels this
+        // call). Without this field being threaded through at all,
+        // `ConnectionInfo::abort_handle()` would be live for `run()`'s own
+        // connections but silently inert for one driven through this
+        // method, which `ConnectionHandler::on_connection_info`'s own doc
+        // steers embedders with their own accept loop toward.
+        self.connection_abort = Arc::new(tokio::sync::Notify::new());
+        let abort = Arc::clone(&self.connection_abort);
+        let result = Box::pin(serve_with_abort(self.run_connection_inner(stream, tls), abort)).await;
 
         // The static channels belong to the connection that negotiated them,
         // and their backends own real resources: an rdpsnd handler is stopped
@@ -2340,8 +2504,21 @@ impl RdpServer {
         let framed = self.accept_finalize(framed, acceptor).await?;
         debug!("Shutting down {}", shutdown_label);
         let (mut inner, _) = framed.into_inner();
-        if let Err(e) = inner.shutdown().await {
-            debug!(?e, "{} shutdown error", shutdown_label);
+        // Bounded for the same reason the `Disconnect`/`EvictedByOtherConnection`
+        // writes are (DISCONNECT_STEP_GRACE, see its doc): a TLS
+        // `shutdown()` queues `close_notify` and then loops writing until
+        // rustls's internal buffer drains, which on a peer that stopped
+        // reading (a zero TCP window, which never times out on its own
+        // without TCP_USER_TIMEOUT) blocks exactly as long as the write this
+        // step follows would have, just one step later. Reusing the same
+        // grace rather than introducing a second constant keeps the two
+        // "deliver the reason, then leave" steps on one documented budget;
+        // see that constant's doc for why 500ms and not EVICTION_GRACE's
+        // 750ms.
+        match tokio::time::timeout(DISCONNECT_STEP_GRACE, inner.shutdown()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => debug!(?e, "{} shutdown error", shutdown_label),
+            Err(_) => debug!("{} shutdown timed out", shutdown_label),
         }
 
         Ok(())
@@ -2505,6 +2682,13 @@ impl RdpServer {
 
             let started = tokio::time::Instant::now();
 
+            // Mint THIS entry's `Notify` before its connection future is
+            // built at all -- see `connection_abort`'s own doc for why at
+            // the START, not the end. `client_accepted` (reached from every
+            // branch below) reads it to hand a `ConnectionAbortHandle` to
+            // `ConnectionInfo::abort_handle`.
+            self.connection_abort = Arc::new(tokio::sync::Notify::new());
+
             let (result, preempted_by) = match self.opts.connection_policy {
                 ConnectionPolicy::Preempt => {
                     // Serve this connection while still accepting: a newcomer that
@@ -2521,6 +2705,7 @@ impl RdpServer {
                     let ctx = self.negotiation_context();
                     let ev_sender = self.ev_sender.clone();
                     let mut recently_evicted = self.recently_evicted.take();
+                    let abort = Arc::clone(&self.connection_abort);
 
                     let outcome = {
                         // Uses the anyhow-returning inner method, not the public
@@ -2532,10 +2717,13 @@ impl RdpServer {
                         // `Option<&anyhow::Error>` -- the same reason upstream's
                         // own accept loop bypasses the public wrapper too.
                         let mut conn: core::pin::Pin<Box<dyn Future<Output = ServerResult<()>> + '_>> = match entry {
-                            Entry::Fresh(stream, _) => {
-                                Box::pin(self.run_connection_inner(stream, TransportTls::Managed))
+                            Entry::Fresh(stream, _) => Box::pin(serve_with_abort(
+                                self.run_connection_inner(stream, TransportTls::Managed),
+                                Arc::clone(&abort),
+                            )),
+                            Entry::Negotiated(candidate, _) => {
+                                Box::pin(serve_with_abort(self.serve_negotiated(candidate), Arc::clone(&abort)))
                             }
-                            Entry::Negotiated(candidate, _) => Box::pin(self.serve_negotiated(candidate)),
                         };
                         let mut probe: PreemptProbe<'_> = Box::pin(core::future::pending());
                         let mut probing = false;
@@ -2693,9 +2881,21 @@ impl RdpServer {
                     // backlog (#1483). The session arm is polled first (biased),
                     // so a client reconnecting the instant a session ends is
                     // taken by the outer loop, not rejected here.
+                    let abort = Arc::clone(&self.connection_abort);
                     let result = match entry {
                         Entry::Fresh(stream, _) => {
-                            let mut conn = core::pin::pin!(self.run_connection_inner(stream, TransportTls::Managed));
+                            // Box::pin, not `core::pin::pin!`: `serve_with_abort`'s
+                            // own state holds `conn` both before and after its
+                            // internal `tokio::pin!`, so stack-pinning it here
+                            // keeps that doubled size inline in `run()`'s own
+                            // state machine across every `.await` in this loop.
+                            // Boxing moves it to the heap instead, matching the
+                            // other five `serve_with_abort` call sites, all of
+                            // which already box.
+                            let mut conn = Box::pin(serve_with_abort(
+                                self.run_connection_inner(stream, TransportTls::Managed),
+                                abort,
+                            ));
                             loop {
                                 tokio::select! {
                                     biased;
@@ -2711,18 +2911,29 @@ impl RdpServer {
                             }
                         }
                         // Unreachable: Reject never produces a Negotiated candidate.
-                        Entry::Negotiated(candidate, _) => self.serve_negotiated(candidate).await,
+                        Entry::Negotiated(candidate, _) => {
+                            Box::pin(serve_with_abort(self.serve_negotiated(candidate), abort)).await
+                        }
                     };
                     (result, None)
                 }
                 ConnectionPolicy::Queue => {
+                    let abort = Arc::clone(&self.connection_abort);
                     let result = match entry {
                         // Same anyhow-vs-ServerResult reasoning as the preemption
                         // branch above.
-                        Entry::Fresh(stream, _) => self.run_connection_inner(stream, TransportTls::Managed).await,
+                        Entry::Fresh(stream, _) => {
+                            Box::pin(serve_with_abort(
+                                self.run_connection_inner(stream, TransportTls::Managed),
+                                abort,
+                            ))
+                            .await
+                        }
                         // Unreachable in practice: `pending` is only ever populated
                         // by the preemption branch above.
-                        Entry::Negotiated(candidate, _) => self.serve_negotiated(candidate).await,
+                        Entry::Negotiated(candidate, _) => {
+                            Box::pin(serve_with_abort(self.serve_negotiated(candidate), abort)).await
+                        }
                     };
                     (result, None)
                 }
@@ -2931,10 +3142,19 @@ impl RdpServer {
                     // merge) predated that parameter and used
                     // user_channel_id, which this fixes to match.
                     let data = encode_share_data_pdu(pdu, 0, io_channel_id, user_channel_id)?;
-                    writer
-                        .write_all(&data)
-                        .await
-                        .map_err(|e| ServerError::io("send server set error info", e))?;
+                    // Bounded: a client that stopped reading must not wedge
+                    // this loop just because it has not acknowledged the
+                    // reason it is being disconnected. Put the reason on the
+                    // wire best-effort, then disconnect regardless.
+                    match tokio::time::timeout(DISCONNECT_STEP_GRACE, writer.write_all(&data)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            debug!(%error, "could not send the disconnect reason; disconnecting anyway");
+                        }
+                        Err(_) => {
+                            debug!("disconnect reason write timed out; disconnecting anyway");
+                        }
+                    }
                     return Ok(RunState::Disconnect);
                 }
                 ServerEvent::GetLocalAddr(tx) => {
@@ -4128,11 +4348,19 @@ impl RdpServer {
         }
 
         if !result.reactivation {
+            // `self.connection_abort` is this connection's own `Notify`,
+            // minted fresh right before this connection's future was built
+            // (see that field's doc) -- so the handle handed out here cannot
+            // reach any other connection.
+            let abort_handle = ConnectionAbortHandle {
+                notify: Arc::clone(&self.connection_abort),
+            };
             with_connection_handler(self.connection_handler.as_ref(), |h| {
                 h.on_connection_info(&ConnectionInfo {
                     keyboard_layout: result.keyboard_layout,
                     keyboard_type: result.keyboard_type,
                     ime_file_name: result.ime_file_name.clone(),
+                    abort_handle: abort_handle.clone(),
                 });
             });
         }
@@ -5081,6 +5309,29 @@ impl RdpServer {
             events.push(event);
         }
         events
+    }
+
+    /// See [`Self::dispatch_server_events`]. Returns whether it decided to
+    /// disconnect (`RunState::Disconnect`), rather than `RunState` itself:
+    /// `RunState` is otherwise crate-private, and exposing it (even behind
+    /// `__test`) would need `visibility::make(pub)` plus a conditional
+    /// re-export this one `bool` avoids needing at all. UDP multitransport is
+    /// always `None` here: no test using this accessor needs it, and
+    /// threading it through would require exposing
+    /// `multitransport::UdpTransportHandle` (crate-private) in this public
+    /// signature too.
+    pub async fn __test_dispatch_server_events(
+        &mut self,
+        events: &mut Vec<ServerEvent>,
+        writer: &mut impl FramedWrite,
+        io_channel_id: u16,
+        user_channel_id: u16,
+        message_channel_id: Option<u16>,
+    ) -> ServerResult<bool> {
+        let state = self
+            .dispatch_server_events(events, writer, io_channel_id, user_channel_id, message_channel_id, None)
+            .await?;
+        Ok(matches!(state, RunState::Disconnect))
     }
 }
 

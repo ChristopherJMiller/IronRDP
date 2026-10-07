@@ -53,8 +53,8 @@ pub use rdpei::{
     TouchEventPdu, TouchFrame,
 };
 pub use server::{
-    AutoReconnectCookieHandle, ConnectionHandler, ConnectionInfo, ConnectionPolicy, CredentialDecision,
-    CredentialValidationError, CredentialValidator, Credentials, ErrorInfoDisconnectHandle,
+    AutoReconnectCookieHandle, ConnectionAbortHandle, ConnectionHandler, ConnectionInfo, ConnectionPolicy,
+    CredentialDecision, CredentialValidationError, CredentialValidator, Credentials, ErrorInfoDisconnectHandle,
     ExactMatchCredentialValidator, PostConnectionAction, RdpServer, RdpServerOptions, RdpServerSecurity, ServerEvent,
     ServerEventSender, StaticChannelFactory, TransportTls, pick_remotefx_entropy_coder,
 };
