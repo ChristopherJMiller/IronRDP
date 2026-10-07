@@ -17,6 +17,7 @@ use ironrdp::pdu::geometry::InclusiveRectangle;
 use ironrdp::pdu::rdp::capability_sets::MajorPlatformType;
 use ironrdp::pdu::rdp::client_info::CompressionType as PduCompressionType;
 use ironrdp::pdu::rdp::headers::CompressionFlags;
+use ironrdp::pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode};
 use ironrdp::pdu::{self, gcc};
 use ironrdp::server::{
     self, Acceptor, DesktopSize, DisplayUpdate, KeyboardEvent, MouseEvent, PixelFormat, RdpServer, RdpServerDisplay,
@@ -1901,6 +1902,230 @@ async fn connection_handler_sees_every_hook_across_a_preemption() {
         assert!(evicted.is_ok(), "the evicted client's connection must be closed");
 
         drop(second);
+        server_task.abort();
+    }))
+    .await;
+}
+
+/// Per-session events left on the server-global channel by a connection that
+/// ended must be dropped before the next connection is served, while the
+/// handful of control events that outlive a connection survive. The returned
+/// count makes the drop observable, and the fresh-path call site relies on
+/// exactly this contract (see `discard_stale_session_events_runs_before_a_fresh_entry_too`
+/// below).
+#[tokio::test]
+async fn discard_stale_session_events_keeps_lifecycle_events_and_returns_the_discarded_count() {
+    let mut server = RdpServer::builder()
+        .with_addr((core::net::Ipv4Addr::LOCALHOST, 0))
+        .with_no_security()
+        .with_no_input()
+        .with_no_display()
+        .build();
+
+    // Two per-session leftovers (must go) around one control event (must stay).
+    let sender = server.event_sender().clone();
+    sender.send(ServerEvent::AutoDetectRttRequest).unwrap();
+    sender.send(ServerEvent::SetAutoReconnectCookie(None)).unwrap();
+    sender
+        .send(ServerEvent::Disconnect(ErrorInfo::ProtocolIndependentCode(
+            ProtocolIndependentCode::DisconnectedByOtherconnection,
+        )))
+        .unwrap();
+
+    let dropped = server.__test_discard_stale_session_events().await;
+    assert_eq!(dropped, 2, "the RttRequest and the stale Disconnect must be discarded");
+
+    let remaining = server.__test_drain_pending_events().await;
+    assert_eq!(
+        remaining.len(),
+        1,
+        "exactly the lifecycle event should have survived the drain: {remaining:?}"
+    );
+    assert!(
+        matches!(&remaining[0], ServerEvent::SetAutoReconnectCookie(None)),
+        "the surviving event should be the control event, not a discarded per-session one: {remaining:?}"
+    );
+}
+
+/// A `ConnectionHandler` whose first `on_disconnected` floods the
+/// server-global channel with stale `Disconnect` events, standing in for
+/// whatever a real session might leave behind uncollected (an eviction
+/// notice, a queued clipboard/RDPSND/EGFX message). 32 of them, not 1: under
+/// the pre-fix code the only thing standing between a brand new connection
+/// and inheriting one of these is `run()`'s own idle-time `select!` picking
+/// `recv` over `accept` on every single one of 32 independent, unbiased
+/// coin flips -- a 1-in-2^32 chance of NOT leaking at least one. Flooding
+/// turns "theoretically racy" into "fails close to every run" for a black-box
+/// test that exercises the real `run()` loop rather than any instrumentation.
+struct StaleEventInjector {
+    counts: Arc<HookCounts>,
+    ev_sender: Arc<StdMutex<Option<UnboundedSender<ServerEvent>>>>,
+    injected: Arc<AtomicBool>,
+}
+
+impl server::ConnectionHandler for StaleEventInjector {
+    fn on_accept(&mut self, _peer: SocketAddr) -> bool {
+        self.counts.accept.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
+    fn on_connection_info(&mut self, _info: &server::ConnectionInfo) {
+        self.counts.info.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn on_disconnected(
+        &mut self,
+        _peer: SocketAddr,
+        _duration: Duration,
+        _error: Option<&server::ServerError>,
+    ) -> server::PostConnectionAction {
+        self.counts.disconnected.fetch_add(1, Ordering::SeqCst);
+        // Only the FIRST disconnect floods the channel: this must simulate
+        // one ended session's leftovers reaching the NEXT connection, not
+        // keep re-flooding on every subsequent disconnect in this test.
+        if !self.injected.swap(true, Ordering::SeqCst)
+            && let Some(sender) = self.ev_sender.lock().expect("lock").as_ref()
+        {
+            for _ in 0..32 {
+                let _ = sender.send(ServerEvent::Disconnect(ErrorInfo::ProtocolIndependentCode(
+                    ProtocolIndependentCode::DisconnectedByOtherconnection,
+                )));
+            }
+        }
+        server::PostConnectionAction::Continue
+    }
+}
+
+/// A TLS server under `ConnectionPolicy::Queue`, wired to a
+/// [`StaleEventInjector`]. Keep the returned display sender alive for the
+/// test, same reason as [`hook_recording_server`].
+fn stale_event_injecting_server() -> (RdpServer, Arc<HookCounts>, UnboundedSender<DisplayUpdate>) {
+    let cert_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-cert.pem");
+    let key_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-key.pem");
+    let identity = TlsIdentityCtx::init_from_paths(&cert_path, &key_path).expect("failed to init TLS identity");
+    let acceptor = identity.make_acceptor().expect("failed to build TLS acceptor");
+
+    let counts = Arc::new(HookCounts::default());
+    let ev_slot: Arc<StdMutex<Option<UnboundedSender<ServerEvent>>>> = Arc::new(StdMutex::new(None));
+    let (display_tx, display_rx) = mpsc::unbounded_channel();
+    let handler = StaleEventInjector {
+        counts: Arc::clone(&counts),
+        ev_sender: Arc::clone(&ev_slot),
+        injected: Arc::new(AtomicBool::new(false)),
+    };
+    let mut server = RdpServer::builder()
+        .with_addr(([127, 0, 0, 1], 0))
+        .with_tls(acceptor)
+        .with_input_handler(TestInputHandler)
+        .with_display_handler(TestDisplay {
+            rx: Arc::new(Mutex::new(display_rx)),
+        })
+        .with_connection_handler(Some(Box::new(handler)))
+        .with_connection_policy(server::ConnectionPolicy::Queue)
+        .build();
+    server.set_credentials(Some(server::Credentials {
+        username: USERNAME.into(),
+        password: PASSWORD.into(),
+        domain: None,
+    }));
+    // Only obtainable once the server exists; the handler reads through the
+    // same slot once its first `on_disconnected` fires.
+    *ev_slot.lock().expect("lock") = Some(server.event_sender().clone());
+    (server, counts, display_tx)
+}
+
+/// `discard_stale_session_events` used to run only for a preemption winner --
+/// the `Negotiated` arm of `run()`'s accept loop -- so a connection accepted
+/// through the ordinary, non-preempting path (`Entry::Fresh`) could inherit
+/// per-session leftovers (a stale `Disconnect`, among others) the previous
+/// session never consumed. Drive that directly, through the public API,
+/// against the real `run()` loop (no test-only instrumentation in
+/// production code): connect A, let its first disconnect flood the channel
+/// with 32 stale `Disconnect` events (see [`StaleEventInjector`]), have B
+/// already waiting to be accepted when that flood lands, and require B to
+/// come up cleanly regardless -- then prove a CURRENT `Disconnect` still
+/// reaches B, so this isn't just "B's handler stopped seeing events".
+#[tokio::test]
+async fn a_fresh_entry_does_not_inherit_the_previous_sessions_stale_events() {
+    let (mut server, counts, _display_tx) = stale_event_injecting_server();
+    let ev = server.event_sender().clone();
+
+    let local = tokio::task::LocalSet::new();
+    Box::pin(local.run_until(async move {
+        let server_task = tokio::task::spawn_local(async move {
+            let _ = server.run().await;
+        });
+        let server_addr = local_addr_of(&ev).await;
+        let connect = || {
+            connect_client(server_addr, |client_addr| {
+                connector::ClientConnector::new(default_client_config(), client_addr)
+            })
+        };
+
+        let (a, _) = connect().await;
+        assert_eq!(
+            counts.wait_until(|(_, info, _)| info >= 1).await,
+            (1, 1, 0),
+            "A must be live before we end it"
+        );
+
+        // B's TCP connect sits in the listener backlog: under `Queue`,
+        // `run()` does not call `listener.accept()` again until A's own
+        // connection future resolves, so B is fully established at the OS
+        // level but unserved for as long as A is live -- exactly the
+        // condition under which `run()`'s idle-time `select!` could
+        // previously race `recv` (the flood, once A ends) against `accept`
+        // (B) and leak into B.
+        let b_connect = tokio::task::spawn_local(async move {
+            connect_client(server_addr, |client_addr| {
+                connector::ClientConnector::new(default_client_config(), client_addr)
+            })
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Ends A, whose `on_disconnected` floods the channel with 32 stale
+        // `Disconnect`s right as `run()` is about to loop back and decide
+        // what B's entry is.
+        drop(a);
+
+        let (accept, info, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            counts.wait_until(|(accept, info, _)| accept >= 2 && info >= 2),
+        )
+        .await
+        .expect("B must still be served and complete its handshake despite the flood");
+        // A real margin, not an immediate check: a leaked stale event would
+        // reach B's own dispatch loop and end it very soon after `on_connection_info`,
+        // not instantly, so assert on `disconnected` only after waiting past
+        // that window.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            (accept, info, counts.get().2),
+            (2, 2, 1),
+            "B must come up clean: still only A disconnected, 500ms after B's own handshake completed"
+        );
+
+        let (b, _) = tokio::time::timeout(Duration::from_secs(5), b_connect)
+            .await
+            .expect("join")
+            .expect("B's handshake must actually succeed, not be torn down by a leaked stale event");
+
+        // A CURRENT event must still reach B: this isn't "B stopped seeing
+        // server events at all", it's specifically the stale ones that must
+        // not reach it.
+        ev.send(ServerEvent::Disconnect(ErrorInfo::ProtocolIndependentCode(
+            ProtocolIndependentCode::DisconnectedByOtherconnection,
+        )))
+        .unwrap();
+        let disconnected_after_fresh_event =
+            tokio::time::timeout(Duration::from_secs(5), counts.wait_until(|(_, _, disc)| disc >= 2))
+                .await
+                .expect("a fresh Disconnect sent for the live connection must still end it")
+                .2;
+        assert_eq!(disconnected_after_fresh_event, 2);
+
+        drop(b);
         server_task.abort();
     }))
     .await;

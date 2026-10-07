@@ -49,8 +49,10 @@ ironrdp-rdpsnd.path = "../ironrdp-rdpsnd"
 ironrdp-rdpsnd-native = { path = "../ironrdp-rdpsnd-native", features = ["capture"] }
 ironrdp-rpc = { path = "../ironrdp-rpc", features = ["__test"] }
 # The EGFX-over-UDP migration in ironrdp-server is behind its `egfx` feature,
-# which nothing else in the workspace enables.
-ironrdp-server = { path = "../ironrdp-server", features = ["egfx"] }
+# which nothing else in the workspace enables. `__test` exposes a handful of
+# internal accessors (see server.rs's `#[cfg(feature = "__test")] impl
+# RdpServer` block) for the e2e tests in tests/e2e.rs.
+ironrdp-server = { path = "../ironrdp-server", features = ["egfx", "__test"] }
 ironrdp-viewer.path = "../ironrdp-viewer"
 ironrdp-tokio.path = "../ironrdp-tokio"
 ironrdp-tls = { path = "../ironrdp-tls", features = ["rustls"] }

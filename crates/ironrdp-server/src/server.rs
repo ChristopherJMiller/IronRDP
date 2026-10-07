@@ -2052,10 +2052,12 @@ impl RdpServer {
 
     /// Drop every event still queued on the server-global channel that
     /// belongs to the SESSION just replaced, keeping only the small set of
-    /// lifecycle/control events meant to survive across connections.
+    /// lifecycle/control events meant to survive across connections. Returns
+    /// how many were discarded.
     ///
-    /// Called immediately before serving a preemption winner. The channel is
-    /// shared across every connection the server ever serves and is read by
+    /// Called immediately before serving ANY entry -- a freshly accepted
+    /// connection as well as a preemption winner. The channel is shared
+    /// across every connection the server ever serves and is read by
     /// whichever connection drains it next -- so any event the outgoing
     /// session produced but never got around to consuming (its OWN eviction
     /// notice, a queued clipboard message, an RDPSND wave, an EGFX frame)
@@ -2072,7 +2074,7 @@ impl RdpServer {
     /// event")` catch-all and is discarded). A new per-session `ServerEvent`
     /// variant is excluded here by default, instead of silently leaking across
     /// a takeover boundary until someone remembers to add it to a denylist.
-    async fn discard_stale_session_events(&mut self) {
+    async fn discard_stale_session_events(&mut self) -> usize {
         use tokio::sync::mpsc::error::TryRecvError;
 
         let ev_receiver = Arc::clone(&self.ev_receiver);
@@ -2095,16 +2097,11 @@ impl RdpServer {
             }
         }
 
-        if discarded > 0 {
-            debug!(
-                discarded,
-                "dropped per-session events the replaced session never consumed -- they must not reach its replacement"
-            );
-        }
-
         for event in keep {
             let _ = self.ev_sender.send(event);
         }
+
+        discarded
     }
 
     /// Build the cheap, cloned snapshot a preempting candidate negotiates
@@ -2418,21 +2415,7 @@ impl RdpServer {
             }
 
             let entry = match pending.take() {
-                Some((candidate, peer)) => {
-                    // The eviction event is queued on the server-global channel
-                    // but consumed by whichever connection happens to drain it.
-                    // If the incumbent was too wedged to take it within
-                    // `EVICTION_GRACE` (very plausibly the case — being wedged
-                    // is why it was evicted), it is still queued now, and the
-                    // WINNER's `client_loop` would drain it and disconnect
-                    // itself, reporting a bogus
-                    // `ERRINFO_DISCONNECTED_BY_OTHERCONNECTION` to the client
-                    // that just took the session over. Discard any such
-                    // leftover before serving it; every other event is put back
-                    // in order.
-                    self.discard_stale_session_events().await;
-                    Entry::Negotiated(candidate, peer)
-                }
+                Some((candidate, peer)) => Entry::Negotiated(candidate, peer),
                 None => {
                     let ev_receiver = Arc::clone(&self.ev_receiver);
                     let mut ev_receiver = ev_receiver.lock().await;
@@ -2477,6 +2460,25 @@ impl RdpServer {
                     Entry::Fresh(accepted.0, accepted.1)
                 }
             };
+
+            // Before serving ANY entry -- the fresh path as well as a
+            // preemption winner -- drop per-session events the previous
+            // session never consumed. The channel is shared across every
+            // connection the server ever serves and read by whichever one
+            // drains it next, so without this a connection that never raced a
+            // preemption at all could still inherit, e.g., a stale Disconnect
+            // left over from the session before it (the incumbent was too
+            // wedged to drain it within `EVICTION_GRACE`, or it simply lost
+            // the race against a fresh accept on this very same select) and
+            // tear itself down reporting a bogus reason to a client that did
+            // nothing wrong.
+            let dropped = self.discard_stale_session_events().await;
+            if dropped > 0 {
+                debug!(
+                    dropped,
+                    "discarded stale per-session events before serving a new connection"
+                );
+            }
 
             let peer = match &entry {
                 Entry::Fresh(_, peer) | Entry::Negotiated(_, peer) => *peer,
@@ -5045,6 +5047,40 @@ impl<'a, W: FramedWrite> SharedWriter<'a, W> {
 
     fn write_counter(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.writes)
+    }
+}
+
+/// Test-only accessors for `RdpServer` internals.
+///
+/// Gated behind the `__test` feature and exist solely so that tests outside
+/// this crate (`ironrdp-testsuite-extra`, which `cargo test --workspace` -- as
+/// IronRDP's own CI runs it -- actually executes; this crate's own `[lib]`
+/// `test = false` means its inline `#[cfg(test)]` modules below do not run
+/// under that invocation) can exercise internal logic without making it part
+/// of the public API.
+#[cfg(feature = "__test")]
+#[doc(hidden)]
+#[expect(
+    clippy::multiple_inherent_impl,
+    reason = "test-only accessors must remain inherent methods for integration tests"
+)]
+impl RdpServer {
+    /// See [`Self::discard_stale_session_events`].
+    pub async fn __test_discard_stale_session_events(&mut self) -> usize {
+        self.discard_stale_session_events().await
+    }
+
+    /// Drain every event currently queued on the server-global channel,
+    /// returning them in order. Test-only window into state that production
+    /// code never needs to inspect directly.
+    pub async fn __test_drain_pending_events(&mut self) -> Vec<ServerEvent> {
+        let ev_receiver = Arc::clone(&self.ev_receiver);
+        let mut ev_receiver = ev_receiver.lock().await;
+        let mut events = Vec::new();
+        while let Ok(event) = ev_receiver.try_recv() {
+            events.push(event);
+        }
+        events
     }
 }
 
